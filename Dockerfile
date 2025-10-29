@@ -15,9 +15,11 @@ RUN set -eux; \
 ENV LANG C.UTF-8
 
 # https://www.ruby-lang.org/en/news/2024/12/25/ruby-3-4-1-released/
-ENV RUBY_VERSION 3.4.1
-ENV RUBY_DOWNLOAD_URL https://cache.ruby-lang.org/pub/ruby/3.4/ruby-3.4.1.tar.xz
-ENV RUBY_DOWNLOAD_SHA256 018d59ffb52be3c0a6d847e22d3fd7a2c52d0ddfee249d3517a0c8c6dbfa70af
+ENV RUBY_VERSION 3.4.0
+ENV RUBY_DOWNLOAD_URL https://cache.ruby-lang.org/pub/ruby/3.4/ruby-3.4.0.tar.xz
+ENV RUBY_DOWNLOAD_SHA256 0081930db22121eb997207f56c0e22720d4f5d21264b5907693f516c32f233ca
+
+COPY dtrace.patch /tmp/dtrace.patch
 
 # some of ruby's build scripts are written in ruby
 #   we purge system ruby later to make sure our final image uses what we just built
@@ -29,6 +31,7 @@ RUN set -eux; \
 		dpkg-dev \
 		libgdbm-dev \
 		ruby \
+		systemtap-sdt-dev \
 	; \
 	rm -rf /var/lib/apt/lists/*; \
 	\
@@ -72,12 +75,16 @@ RUN set -eux; \
 	} > file.c.new; \
 	mv file.c.new file.c; \
 	\
+	patch -p1 < /tmp/dtrace.patch; \
+	\
 	autoconf; \
 	gnuArch="$(dpkg-architecture --query DEB_BUILD_GNU_TYPE)"; \
 	./configure \
 		--build="$gnuArch" \
 		--disable-install-doc \
-		--enable-shared \
+		--disable-shared \
+		--enable-dtrace \
+		optflags="-fno-omit-frame-pointer" \
 		${rustArch:+--enable-yjit} \
 	; \
 	make -j "$(nproc)"; \
@@ -87,7 +94,7 @@ RUN set -eux; \
 	apt-mark auto '.*' > /dev/null; \
 	apt-mark manual $savedAptMark > /dev/null; \
 	find /usr/local -type f -executable -not \( -name '*tkinter*' \) -exec ldd '{}' ';' \
-		| awk '/=>/ { so = $(NF-1); if (index(so, "/usr/local/") == 1) { next }; gsub("^/(usr/)?", "", so); printf "*%s\n", so }' \
+		| awk '/=>/ { so = $(NF-1); if (iexex(so, "/usr/local/") == 1) { next }; gsub("^/(usr/)?", "", so); printf "*%s\n", so }' \
 		| sort -u \
 		| xargs -r dpkg-query --search \
 		| cut -d: -f1 \

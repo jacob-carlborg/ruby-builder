@@ -1,0 +1,1175 @@
+diff --git a/common.mk b/common.mk
+index a089f25514..22e999a694 100644
+--- a/common.mk
++++ b/common.mk
+@@ -20082,6 +20082,7 @@ vm.$(OBJEXT): {$(VPATH)}vm_exec.c
+ vm.$(OBJEXT): {$(VPATH)}vm_exec.h
+ vm.$(OBJEXT): {$(VPATH)}vm_insnhelper.c
+ vm.$(OBJEXT): {$(VPATH)}vm_insnhelper.h
++vm.$(OBJEXT): {$(VPATH)}generate_json_helper.c
+ vm.$(OBJEXT): {$(VPATH)}vm_method.c
+ vm.$(OBJEXT): {$(VPATH)}vm_opts.h
+ vm.$(OBJEXT): {$(VPATH)}vm_sync.h
+diff --git a/fbuffer.h b/fbuffer.h
+new file mode 100644
+index 0000000000..006f75603e
+--- /dev/null
++++ b/fbuffer.h
+@@ -0,0 +1,215 @@
++#ifndef _FBUFFER_H_
++#define _FBUFFER_H_
++
++#include "ruby.h"
++#include "ruby/encoding.h"
++
++/* shims */
++/* This is the fallback definition from Ruby 3.4 */
++
++#ifndef RBIMPL_STDBOOL_H
++#if defined(__cplusplus)
++# if defined(HAVE_STDBOOL_H) && (__cplusplus >= 201103L)
++#  include <cstdbool>
++# endif
++#elif defined(HAVE_STDBOOL_H)
++# include <stdbool.h>
++#elif !defined(HAVE__BOOL)
++typedef unsigned char _Bool;
++# define bool  _Bool
++# define true  ((_Bool)+1)
++# define false ((_Bool)+0)
++# define __bool_true_false_are_defined
++#endif
++#endif
++
++#ifndef RB_UNLIKELY
++#define RB_UNLIKELY(expr) expr
++#endif
++
++#ifndef RB_LIKELY
++#define RB_LIKELY(expr) expr
++#endif
++
++#ifndef MAYBE_UNUSED
++# define MAYBE_UNUSED(x) x
++#endif
++
++enum fbuffer_type {
++    FBUFFER_HEAP_ALLOCATED = 0,
++    FBUFFER_STACK_ALLOCATED = 1,
++};
++
++typedef struct FBufferStruct {
++    enum fbuffer_type type;
++    unsigned long initial_length;
++    unsigned long len;
++    unsigned long capa;
++    char *ptr;
++    VALUE io;
++} FBuffer;
++
++#define JSON_GENERATOR
++#define FBUFFER_STACK_SIZE 512
++#define FBUFFER_IO_BUFFER_SIZE (16384 - 1)
++#define FBUFFER_INITIAL_LENGTH_DEFAULT 1024
++
++#define FBUFFER_PTR(fb) ((fb)->ptr)
++#define FBUFFER_LEN(fb) ((fb)->len)
++#define FBUFFER_CAPA(fb) ((fb)->capa)
++#define FBUFFER_PAIR(fb) FBUFFER_PTR(fb), FBUFFER_LEN(fb)
++
++static void fbuffer_free(FBuffer *fb);
++#ifndef JSON_GENERATOR
++static void fbuffer_clear(FBuffer *fb);
++#endif
++static void fbuffer_append(FBuffer *fb, const char *newstr, unsigned long len);
++#ifdef JSON_GENERATOR
++static void fbuffer_append_long(FBuffer *fb, long number);
++#endif
++static inline void fbuffer_append_char(FBuffer *fb, char newchr);
++#ifdef JSON_GENERATOR
++static VALUE fbuffer_finalize(FBuffer *fb);
++#endif
++
++static void fbuffer_stack_init(FBuffer *fb, unsigned long initial_length, char *stack_buffer, long stack_buffer_size)
++{
++    fb->initial_length = (initial_length > 0) ? initial_length : FBUFFER_INITIAL_LENGTH_DEFAULT;
++    if (stack_buffer) {
++        fb->type = FBUFFER_STACK_ALLOCATED;
++        fb->ptr = stack_buffer;
++        fb->capa = stack_buffer_size;
++    }
++}
++
++static void fbuffer_free(FBuffer *fb)
++{
++    if (fb->ptr && fb->type == FBUFFER_HEAP_ALLOCATED) {
++        ruby_xfree(fb->ptr);
++    }
++}
++
++static void fbuffer_clear(FBuffer *fb)
++{
++    fb->len = 0;
++}
++
++static void fbuffer_flush(FBuffer *fb)
++{
++    rb_io_write(fb->io, rb_utf8_str_new(fb->ptr, fb->len));
++    fbuffer_clear(fb);
++}
++
++static void fbuffer_realloc(FBuffer *fb, unsigned long required)
++{
++    if (required > fb->capa) {
++        if (fb->type == FBUFFER_STACK_ALLOCATED) {
++            const char *old_buffer = fb->ptr;
++            fb->ptr = ALLOC_N(char, required);
++            fb->type = FBUFFER_HEAP_ALLOCATED;
++            MEMCPY(fb->ptr, old_buffer, char, fb->len);
++        } else {
++            REALLOC_N(fb->ptr, char, required);
++        }
++        fb->capa = required;
++    }
++}
++
++static void fbuffer_do_inc_capa(FBuffer *fb, unsigned long requested)
++{
++    if (RB_UNLIKELY(fb->io)) {
++        if (fb->capa < FBUFFER_IO_BUFFER_SIZE) {
++            fbuffer_realloc(fb, FBUFFER_IO_BUFFER_SIZE);
++        } else {
++            fbuffer_flush(fb);
++        }
++
++        if (RB_LIKELY(requested < fb->capa)) {
++            return;
++        }
++    }
++
++    unsigned long required;
++
++    if (RB_UNLIKELY(!fb->ptr)) {
++        fb->ptr = ALLOC_N(char, fb->initial_length);
++        fb->capa = fb->initial_length;
++    }
++
++    for (required = fb->capa; requested > required - fb->len; required <<= 1);
++
++    fbuffer_realloc(fb, required);
++}
++
++static inline void fbuffer_inc_capa(FBuffer *fb, unsigned long requested)
++{
++    if (RB_UNLIKELY(requested > fb->capa - fb->len)) {
++        fbuffer_do_inc_capa(fb, requested);
++    }
++}
++
++static void fbuffer_append(FBuffer *fb, const char *newstr, unsigned long len)
++{
++    if (len > 0) {
++        fbuffer_inc_capa(fb, len);
++        MEMCPY(fb->ptr + fb->len, newstr, char, len);
++        fb->len += len;
++    }
++}
++
++#ifdef JSON_GENERATOR
++static void fbuffer_append_str(FBuffer *fb, VALUE str)
++{
++    const char *newstr = StringValuePtr(str);
++    unsigned long len = RSTRING_LEN(str);
++
++    RB_GC_GUARD(str);
++
++    fbuffer_append(fb, newstr, len);
++}
++#endif
++
++static inline void fbuffer_append_char(FBuffer *fb, char newchr)
++{
++    fbuffer_inc_capa(fb, 1);
++    *(fb->ptr + fb->len) = newchr;
++    fb->len++;
++}
++
++#ifdef JSON_GENERATOR
++static long fltoa(long number, char *buf)
++{
++    static const char digits[] = "0123456789";
++    long sign = number;
++    char* tmp = buf;
++
++    if (sign < 0) number = -number;
++    do *tmp-- = digits[number % 10]; while (number /= 10);
++    if (sign < 0) *tmp-- = '-';
++    return buf - tmp;
++}
++
++#define LONG_BUFFER_SIZE 20
++static void fbuffer_append_long(FBuffer *fb, long number)
++{
++    char buf[LONG_BUFFER_SIZE];
++    char *buffer_end = buf + LONG_BUFFER_SIZE;
++    long len = fltoa(number, buffer_end - 1);
++    fbuffer_append(fb, buffer_end - len, len);
++}
++
++static VALUE fbuffer_finalize(FBuffer *fb)
++{
++    if (fb->io) {
++        fbuffer_flush(fb);
++        fbuffer_free(fb);
++        rb_io_flush(fb->io);
++        return fb->io;
++    } else {
++        VALUE result = rb_utf8_str_new(FBUFFER_PTR(fb), FBUFFER_LEN(fb));
++        fbuffer_free(fb);
++        return result;
++    }
++}
++#endif
++#endif
+diff --git a/generate_json_helper.c b/generate_json_helper.c
+new file mode 100644
+index 0000000000..a5e2829448
+--- /dev/null
++++ b/generate_json_helper.c
+@@ -0,0 +1,818 @@
++#include "ruby.h"
++#include "fbuffer.h"
++
++void generate_json_helper() {}
++
++typedef struct JSON_Generator_StateStruct {
++    VALUE indent;
++    VALUE space;
++    VALUE space_before;
++    VALUE object_nl;
++    VALUE array_nl;
++
++    long max_nesting;
++    long depth;
++    long buffer_initial_length;
++
++    bool allow_nan;
++    bool ascii_only;
++    bool script_safe;
++    bool strict;
++} JSON_Generator_State;
++
++static VALUE eGeneratorError, eNestingError, Encoding_UTF_8;
++
++static ID i_to_s, i_to_json, i_encode;
++
++#define GET_STATE_TO(self, state) \
++    TypedData_Get_Struct(self, JSON_Generator_State, &JSON_Generator_State_type, state)
++
++#define GET_STATE(self)                       \
++    JSON_Generator_State *state;              \
++    GET_STATE_TO(self, state)
++
++struct generate_json_data;
++
++typedef struct error (*generator_func)(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++
++struct generate_json_data {
++    FBuffer *buffer;
++    VALUE vstate;
++    JSON_Generator_State *state;
++    VALUE obj;
++    generator_func func;
++};
++
++enum error_kind {
++    error_kind_ok,
++    error_kind_generator_error,
++    error_kind_nesting_error
++};
++
++struct error {
++    enum error_kind kind;
++    VALUE message;
++    VALUE invalid_object;
++};
++
++static struct error generate_json(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++static struct error generate_json_object(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++static struct error generate_json_array(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++static struct error generate_json_string(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++static void generate_json_null(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++static void generate_json_false(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++static void generate_json_true(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++#ifdef RUBY_INTEGER_UNIFICATION
++static void generate_json_integer(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++#endif
++static void generate_json_fixnum(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++static void generate_json_bignum(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++static struct error generate_json_float(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj);
++
++static int usascii_encindex, utf8_encindex, binary_encindex;
++
++static struct error error_ok() {
++    struct error error = { .kind = error_kind_ok };
++    return error;
++}
++
++static struct error build_generator_error_str(VALUE invalid_object, VALUE str)
++{
++    struct error error = {
++        .kind = error_kind_generator_error,
++        .message = str,
++        .invalid_object = invalid_object
++    };
++
++    return error;
++}
++
++#ifdef RBIMPL_ATTR_FORMAT
++RBIMPL_ATTR_FORMAT(RBIMPL_PRINTF_FORMAT, 2, 3)
++#endif
++static struct error build_generator_error(VALUE invalid_object, const char *fmt, ...)
++{
++    va_list args;
++    va_start(args, fmt);
++    VALUE str = rb_vsprintf(fmt, args);
++    va_end(args);
++    build_generator_error_str(invalid_object, str);
++}
++
++static struct error build_error(enum error_kind kind, const char *fmt, ...)
++{
++    va_list args;
++    va_start(args, fmt);
++    VALUE str = rb_vsprintf(fmt, args);
++    va_end(args);
++
++    struct error error = {
++        .kind = kind,
++        .message = str,
++        .invalid_object = Qnil
++    };
++
++    return error;
++}
++
++// 0 - single byte char that don't need to be escaped.
++// (x | 8) - char that needs to be escaped.
++static const unsigned char CHAR_LENGTH_MASK = 7;
++
++static const unsigned char escape_table[256] = {
++    // ASCII Control Characters
++     9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
++     9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
++    // ASCII Characters
++     0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // '"'
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, // '\\'
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++
++static const unsigned char ascii_only_escape_table[256] = {
++    // ASCII Control Characters
++     9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
++     9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
++    // ASCII Characters
++     0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // '"'
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, // '\\'
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    // Continuation byte
++     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++    // First byte of a  2-byte code point
++     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
++     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
++    // First byte of a 3-byte code point
++     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
++    //First byte of a 4+ byte code point
++     4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 9, 9,
++};
++
++static const unsigned char script_safe_escape_table[256] = {
++    // ASCII Control Characters
++     9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
++     9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
++    // ASCII Characters
++     0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, // '"' and '/'
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, // '\\'
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    // Continuation byte
++     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++    // First byte of a 2-byte code point
++     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
++     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
++    // First byte of a 3-byte code point
++     3, 3,11, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, // 0xE2 is the start of \u2028 and \u2029
++    //First byte of a 4+ byte code point
++     4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 9, 9,
++};
++
++static void State_mark(void *ptr)
++{
++    JSON_Generator_State *state = ptr;
++    rb_gc_mark_movable(state->indent);
++    rb_gc_mark_movable(state->space);
++    rb_gc_mark_movable(state->space_before);
++    rb_gc_mark_movable(state->object_nl);
++    rb_gc_mark_movable(state->array_nl);
++}
++
++static void State_compact(void *ptr)
++{
++    JSON_Generator_State *state = ptr;
++    state->indent = rb_gc_location(state->indent);
++    state->space = rb_gc_location(state->space);
++    state->space_before = rb_gc_location(state->space_before);
++    state->object_nl = rb_gc_location(state->object_nl);
++    state->array_nl = rb_gc_location(state->array_nl);
++}
++
++static void State_free(void *ptr)
++{
++    JSON_Generator_State *state = ptr;
++    ruby_xfree(state);
++}
++
++static size_t State_memsize(const void *ptr)
++{
++    return sizeof(JSON_Generator_State);
++}
++
++static const rb_data_type_t JSON_Generator_State_type = {
++    "JSON/Generator/State",
++    {
++        .dmark = State_mark,
++        .dfree = State_free,
++        .dsize = State_memsize,
++        .dcompact = State_compact,
++    },
++    0, 0,
++    RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_FROZEN_SHAREABLE,
++};
++
++static void state_init(JSON_Generator_State *state)
++{
++    state->max_nesting = 100;
++    state->buffer_initial_length = FBUFFER_INITIAL_LENGTH_DEFAULT;
++}
++
++struct hash_foreach_arg {
++    struct generate_json_data *data;
++    int iter;
++};
++
++static int
++json_object_i(VALUE key, VALUE val, VALUE _arg)
++{
++    struct hash_foreach_arg *arg = (struct hash_foreach_arg *)_arg;
++    struct generate_json_data *data = arg->data;
++
++    FBuffer *buffer = data->buffer;
++    JSON_Generator_State *state = data->state;
++
++    long depth = state->depth;
++    int j;
++
++    if (arg->iter > 0) fbuffer_append_char(buffer, ',');
++    if (RB_UNLIKELY(state->object_nl)) {
++        fbuffer_append_str(buffer, state->object_nl);
++    }
++    if (RB_UNLIKELY(state->indent)) {
++        for (j = 0; j < depth; j++) {
++            fbuffer_append_str(buffer, state->indent);
++        }
++    }
++
++    VALUE key_to_s;
++    switch(rb_type(key)) {
++        case T_STRING:
++            if (RB_LIKELY(RBASIC_CLASS(key) == rb_cString)) {
++                key_to_s = key;
++            } else {
++                key_to_s = rb_funcall(key, i_to_s, 0);
++            }
++            break;
++        case T_SYMBOL:
++            key_to_s = rb_sym2str(key);
++            break;
++        default:
++            key_to_s = rb_convert_type(key, T_STRING, "String", "to_s");
++            break;
++    }
++
++    if (RB_LIKELY(RBASIC_CLASS(key_to_s) == rb_cString)) {
++        generate_json_string(buffer, data, state, key_to_s);
++    } else {
++        generate_json(buffer, data, state, key_to_s);
++    }
++    if (RB_UNLIKELY(state->space_before)) fbuffer_append_str(buffer, state->space_before);
++    fbuffer_append_char(buffer, ':');
++    if (RB_UNLIKELY(state->space)) fbuffer_append_str(buffer, state->space);
++    generate_json(buffer, data, state, val);
++
++    arg->iter++;
++    return ST_CONTINUE;
++}
++
++static void buffer_initial_length_set(JSON_Generator_State *state, VALUE buffer_initial_length)
++{
++    Check_Type(buffer_initial_length, T_FIXNUM);
++    long initial_length = FIX2LONG(buffer_initial_length);
++    if (initial_length > 0) {
++        state->buffer_initial_length = initial_length;
++    }
++}
++
++static VALUE string_config(VALUE config)
++{
++    if (RTEST(config)) {
++        Check_Type(config, T_STRING);
++        if (RSTRING_LEN(config)) {
++            return rb_str_new_frozen(config);
++        }
++    }
++    return Qfalse;
++}
++
++static long long_config(VALUE num)
++{
++    return RTEST(num) ? FIX2LONG(num) : 0;
++}
++
++static inline int enc_utf8_compatible_p(int enc_idx)
++{
++    if (enc_idx == usascii_encindex) return 1;
++    if (enc_idx == utf8_encindex) return 1;
++    return 0;
++}
++
++static VALUE encode_json_string_try(VALUE str)
++{
++    return rb_funcall(str, i_encode, 1, Encoding_UTF_8);
++}
++
++static inline VALUE ensure_valid_encoding(VALUE str)
++{
++    int encindex = RB_ENCODING_GET(str);
++    VALUE utf8_string;
++//    if (RB_UNLIKELY(!enc_utf8_compatible_p(encindex))) {
++//        if (encindex == binary_encindex) {
++//            utf8_string = rb_enc_associate_index(rb_str_dup(str), utf8_encindex);
++//            switch (rb_enc_str_coderange(utf8_string)) {
++//                case ENC_CODERANGE_7BIT:
++//                    return utf8_string;
++//                case ENC_CODERANGE_VALID:
++//                    // For historical reason, we silently reinterpret binary strings as UTF-8 if it would work.
++//                    // TODO: Raise in 3.0.0
++//                    rb_warn("JSON.generate: UTF-8 string passed as BINARY, this will raise an encoding error in json 3.0");
++//                    return utf8_string;
++//                    break;
++//            }
++//        }
++//
++//        str = rb_rescue(encode_json_string_try, str, encode_json_string_rescue, str);
++//    }
++    return str;
++}
++
++static struct error generate_json_object(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    long max_nesting = state->max_nesting;
++    long depth = ++state->depth;
++    int j;
++
++    if (max_nesting != 0 && depth > max_nesting) {
++        return build_error(error_kind_nesting_error, "nesting of %ld is too deep", --state->depth);
++    }
++
++    if (RHASH_SIZE(obj) == 0) {
++        fbuffer_append(buffer, "{}", 2);
++        --state->depth;
++        return error_ok();
++    }
++
++    fbuffer_append_char(buffer, '{');
++
++    struct hash_foreach_arg arg = {
++        .data = data,
++        .iter = 0,
++    };
++    rb_hash_foreach(obj, json_object_i, (VALUE)&arg);
++
++    depth = --state->depth;
++    if (RB_UNLIKELY(state->object_nl)) {
++        fbuffer_append_str(buffer, state->object_nl);
++        if (RB_UNLIKELY(state->indent)) {
++            for (j = 0; j < depth; j++) {
++                fbuffer_append_str(buffer, state->indent);
++            }
++        }
++    }
++    fbuffer_append_char(buffer, '}');
++
++    return error_ok();
++}
++
++static struct error generate_json_array(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    long max_nesting = state->max_nesting;
++    long depth = ++state->depth;
++    int i, j;
++    if (max_nesting != 0 && depth > max_nesting) {
++        return build_error(error_kind_nesting_error, "nesting of %ld is too deep", --state->depth);
++    }
++
++    if (RARRAY_LEN(obj) == 0) {
++        fbuffer_append(buffer, "[]", 2);
++        --state->depth;
++        return error_ok();
++    }
++
++    fbuffer_append_char(buffer, '[');
++    if (RB_UNLIKELY(state->array_nl)) fbuffer_append_str(buffer, state->array_nl);
++    for(i = 0; i < RARRAY_LEN(obj); i++) {
++        if (i > 0) {
++            fbuffer_append_char(buffer, ',');
++            if (RB_UNLIKELY(state->array_nl)) fbuffer_append_str(buffer, state->array_nl);
++        }
++        if (RB_UNLIKELY(state->indent)) {
++            for (j = 0; j < depth; j++) {
++                fbuffer_append_str(buffer, state->indent);
++            }
++        }
++        generate_json(buffer, data, state, RARRAY_AREF(obj, i));
++    }
++    state->depth = --depth;
++    if (RB_UNLIKELY(state->array_nl)) {
++        fbuffer_append_str(buffer, state->array_nl);
++        if (RB_UNLIKELY(state->indent)) {
++            for (j = 0; j < depth; j++) {
++                fbuffer_append_str(buffer, state->indent);
++            }
++        }
++    }
++    fbuffer_append_char(buffer, ']');
++
++    return error_ok();
++}
++
++static void convert_UTF8_to_ASCII_only_JSON(FBuffer *out_buffer, VALUE str, const unsigned char escape_table[256])
++{
++    const char *hexdig = "0123456789abcdef";
++    char scratch[12] = { '\\', 'u', 0, 0, 0, 0, '\\', 'u' };
++
++    const char *ptr = RSTRING_PTR(str);
++    unsigned long len = RSTRING_LEN(str);
++
++    unsigned long beg = 0, pos = 0;
++
++#define FLUSH_POS(bytes) if (pos > beg) { fbuffer_append(out_buffer, &ptr[beg], pos - beg); } pos += bytes; beg = pos;
++
++    while (pos < len) {
++        unsigned char ch = ptr[pos];
++        unsigned char ch_len = escape_table[ch];
++
++        if (RB_UNLIKELY(ch_len)) {
++            switch (ch_len) {
++                case 9: {
++                    FLUSH_POS(1);
++                    switch (ch) {
++                        case '"':  fbuffer_append(out_buffer, "\\\"", 2); break;
++                        case '\\': fbuffer_append(out_buffer, "\\\\", 2); break;
++                        case '/':  fbuffer_append(out_buffer, "\\/", 2); break;
++                        case '\b': fbuffer_append(out_buffer, "\\b", 2); break;
++                        case '\f': fbuffer_append(out_buffer, "\\f", 2); break;
++                        case '\n': fbuffer_append(out_buffer, "\\n", 2); break;
++                        case '\r': fbuffer_append(out_buffer, "\\r", 2); break;
++                        case '\t': fbuffer_append(out_buffer, "\\t", 2); break;
++                        default: {
++                            scratch[2] = '0';
++                            scratch[3] = '0';
++                            scratch[4] = hexdig[(ch >> 4) & 0xf];
++                            scratch[5] = hexdig[ch & 0xf];
++                            fbuffer_append(out_buffer, scratch, 6);
++                            break;
++                        }
++                    }
++                    break;
++                }
++                default: {
++                    uint32_t wchar = 0;
++                    ch_len = ch_len & CHAR_LENGTH_MASK;
++
++                    switch(ch_len) {
++                        case 2:
++                            wchar = ptr[pos] & 0x1F;
++                            break;
++                        case 3:
++                            wchar = ptr[pos] & 0x0F;
++                            break;
++                        case 4:
++                            wchar = ptr[pos] & 0x07;
++                            break;
++                    }
++
++                    for (short i = 1; i < ch_len; i++) {
++                        wchar = (wchar << 6) | (ptr[pos+i] & 0x3F);
++                    }
++
++                    FLUSH_POS(ch_len);
++
++                    if (wchar <= 0xFFFF) {
++                        scratch[2] = hexdig[wchar >> 12];
++                        scratch[3] = hexdig[(wchar >> 8) & 0xf];
++                        scratch[4] = hexdig[(wchar >> 4) & 0xf];
++                        scratch[5] = hexdig[wchar & 0xf];
++                        fbuffer_append(out_buffer, scratch, 6);
++                    } else {
++                        uint16_t hi, lo;
++                        wchar -= 0x10000;
++                        hi = 0xD800 + (uint16_t)(wchar >> 10);
++                        lo = 0xDC00 + (uint16_t)(wchar & 0x3FF);
++
++                        scratch[2] = hexdig[hi >> 12];
++                        scratch[3] = hexdig[(hi >> 8) & 0xf];
++                        scratch[4] = hexdig[(hi >> 4) & 0xf];
++                        scratch[5] = hexdig[hi & 0xf];
++
++                        scratch[8] = hexdig[lo >> 12];
++                        scratch[9] = hexdig[(lo >> 8) & 0xf];
++                        scratch[10] = hexdig[(lo >> 4) & 0xf];
++                        scratch[11] = hexdig[lo & 0xf];
++
++                        fbuffer_append(out_buffer, scratch, 12);
++                    }
++
++                    break;
++                }
++            }
++        } else {
++            pos++;
++        }
++    }
++#undef FLUSH_POS
++
++    if (beg < len) {
++        fbuffer_append(out_buffer, &ptr[beg], len - beg);
++    }
++
++    RB_GC_GUARD(str);
++}
++
++/* Converts in_string to a JSON string (without the wrapping '"'
++ * characters) in FBuffer out_buffer.
++ *
++ * Character are JSON-escaped according to:
++ *
++ * - Always: ASCII control characters (0x00-0x1F), dquote, and
++ *   backslash.
++ *
++ * - If out_ascii_only: non-ASCII characters (>0x7F)
++ *
++ * - If script_safe: forwardslash (/), line separator (U+2028), and
++ *   paragraph separator (U+2029)
++ *
++ * Everything else (should be UTF-8) is just passed through and
++ * appended to the result.
++ */
++static inline void convert_UTF8_to_JSON(FBuffer *out_buffer, VALUE str, const unsigned char escape_table[256])
++{
++    const char *hexdig = "0123456789abcdef";
++    char scratch[12] = { '\\', 'u', 0, 0, 0, 0, '\\', 'u' };
++
++    const char *ptr = RSTRING_PTR(str);
++    unsigned long len = RSTRING_LEN(str);
++
++    unsigned long beg = 0, pos = 0;
++
++#define FLUSH_POS(bytes) if (pos > beg) { fbuffer_append(out_buffer, &ptr[beg], pos - beg); } pos += bytes; beg = pos;
++
++    while (pos < len) {
++        unsigned char ch = ptr[pos];
++        unsigned char ch_len = escape_table[ch];
++        /* JSON encoding */
++
++        if (RB_UNLIKELY(ch_len)) {
++            switch (ch_len) {
++                case 9: {
++                    FLUSH_POS(1);
++                    switch (ch) {
++                        case '"':  fbuffer_append(out_buffer, "\\\"", 2); break;
++                        case '\\': fbuffer_append(out_buffer, "\\\\", 2); break;
++                        case '/':  fbuffer_append(out_buffer, "\\/", 2); break;
++                        case '\b': fbuffer_append(out_buffer, "\\b", 2); break;
++                        case '\f': fbuffer_append(out_buffer, "\\f", 2); break;
++                        case '\n': fbuffer_append(out_buffer, "\\n", 2); break;
++                        case '\r': fbuffer_append(out_buffer, "\\r", 2); break;
++                        case '\t': fbuffer_append(out_buffer, "\\t", 2); break;
++                        default: {
++                            scratch[2] = '0';
++                            scratch[3] = '0';
++                            scratch[4] = hexdig[(ch >> 4) & 0xf];
++                            scratch[5] = hexdig[ch & 0xf];
++                            fbuffer_append(out_buffer, scratch, 6);
++                            break;
++                        }
++                    }
++                    break;
++                }
++                case 11: {
++                    unsigned char b2 = ptr[pos + 1];
++                    if (RB_UNLIKELY(b2 == 0x80)) {
++                        unsigned char b3 = ptr[pos + 2];
++                        if (b3 == 0xA8) {
++                            FLUSH_POS(3);
++                            fbuffer_append(out_buffer, "\\u2028", 6);
++                            break;
++                        } else if (b3 == 0xA9) {
++                            FLUSH_POS(3);
++                            fbuffer_append(out_buffer, "\\u2029", 6);
++                            break;
++                        }
++                    }
++                    ch_len = 3;
++                    // fallthrough
++                }
++                default:
++                    pos += ch_len;
++                    break;
++            }
++        } else {
++            pos++;
++        }
++    }
++#undef FLUSH_POS
++
++    if (beg < len) {
++        fbuffer_append(out_buffer, &ptr[beg], len - beg);
++    }
++
++    RB_GC_GUARD(str);
++}
++
++static struct error generate_json_string(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    obj = ensure_valid_encoding(obj);
++
++    fbuffer_append_char(buffer, '"');
++    struct error result = error_ok();
++
++    switch(rb_enc_str_coderange(obj)) {
++        case ENC_CODERANGE_7BIT:
++        case ENC_CODERANGE_VALID:
++            if (RB_UNLIKELY(state->ascii_only)) {
++                convert_UTF8_to_ASCII_only_JSON(buffer, obj, state->script_safe ? script_safe_escape_table : ascii_only_escape_table);
++            } else {
++                convert_UTF8_to_JSON(buffer, obj, state->script_safe ? script_safe_escape_table : escape_table);
++            }
++            break;
++        default:
++            result = build_generator_error(obj, "source sequence is illegal/malformed utf-8");
++            break;
++    }
++    fbuffer_append_char(buffer, '"');
++    return result;
++}
++
++static void generate_json_null(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    fbuffer_append(buffer, "null", 4);
++}
++
++static void generate_json_false(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    fbuffer_append(buffer, "false", 5);
++}
++
++static void generate_json_true(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    fbuffer_append(buffer, "true", 4);
++}
++
++static void generate_json_fixnum(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    fbuffer_append_long(buffer, FIX2LONG(obj));
++}
++
++static void generate_json_bignum(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    VALUE tmp = rb_funcall(obj, i_to_s, 0);
++    fbuffer_append_str(buffer, tmp);
++}
++
++#ifdef RUBY_INTEGER_UNIFICATION
++static void generate_json_integer(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    if (FIXNUM_P(obj))
++        generate_json_fixnum(buffer, data, state, obj);
++    else
++        generate_json_bignum(buffer, data, state, obj);
++}
++#endif
++
++static struct error generate_json_float(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    double value = RFLOAT_VALUE(obj);
++    char allow_nan = state->allow_nan;
++    VALUE tmp = rb_funcall(obj, i_to_s, 0);
++    if (!allow_nan) {
++        if (isinf(value) || isnan(value)) {
++            return build_generator_error(obj, "%"PRIsVALUE" not allowed in JSON", tmp);
++        }
++    }
++    fbuffer_append_str(buffer, tmp);
++    return error_ok();
++}
++
++static struct error generate_json(FBuffer *buffer, struct generate_json_data *data, JSON_Generator_State *state, VALUE obj)
++{
++    VALUE tmp;
++    if (obj == Qnil) {
++        generate_json_null(buffer, data, state, obj);
++    } else if (obj == Qfalse) {
++        generate_json_false(buffer, data, state, obj);
++    } else if (obj == Qtrue) {
++        generate_json_true(buffer, data, state, obj);
++    } else if (RB_SPECIAL_CONST_P(obj)) {
++        if (RB_FIXNUM_P(obj)) {
++            generate_json_fixnum(buffer, data, state, obj);
++        } else if (RB_FLONUM_P(obj)) {
++            generate_json_float(buffer, data, state, obj);
++        } else {
++            goto general;
++        }
++    } else {
++        VALUE klass = RBASIC_CLASS(obj);
++        switch (RB_BUILTIN_TYPE(obj)) {
++            case T_BIGNUM:
++                generate_json_bignum(buffer, data, state, obj);
++                break;
++            case T_HASH:
++                if (klass != rb_cHash) goto general;
++                return generate_json_object(buffer, data, state, obj);
++                break;
++            case T_ARRAY:
++                if (klass != rb_cArray) goto general;
++                return generate_json_array(buffer, data, state, obj);
++                break;
++            case T_STRING:
++                if (klass != rb_cString) goto general;
++                return generate_json_string(buffer, data, state, obj);
++                break;
++            case T_FLOAT:
++                if (klass != rb_cFloat) goto general;
++                return generate_json_float(buffer, data, state, obj);
++                break;
++            default:
++            general:
++                if (state->strict) {
++                    return build_generator_error(obj, "%"PRIsVALUE" not allowed in JSON", CLASS_OF(obj));
++                } else if (rb_respond_to(obj, i_to_json)) {
++                    tmp = rb_funcall(obj, i_to_json, 0);
++                    Check_Type(tmp, T_STRING);
++                    fbuffer_append_str(buffer, tmp);
++                } else {
++                    tmp = rb_funcall(obj, i_to_s, 0);
++                    Check_Type(tmp, T_STRING);
++                    generate_json_string(buffer, data, state, tmp);
++                }
++        }
++    }
++
++    return error_ok();
++}
++
++static VALUE generate_json_try(VALUE d)
++{
++    struct generate_json_data *data = (struct generate_json_data *)d;
++
++    data->func(data->buffer, data, data->state, data->obj);
++
++    return Qnil;
++}
++
++static VALUE generate_json_rescue(VALUE d, VALUE exc)
++{
++    struct generate_json_data *data = (struct generate_json_data *)d;
++    fbuffer_free(data->buffer);
++
++    rb_exc_raise(exc);
++
++    return Qundef;
++}
++
++static VALUE cState_m_generate(VALUE obj)
++{
++    JSON_Generator_State state = {0};
++    state_init(&state);
++
++    i_to_s = rb_intern("to_s");
++    i_to_json = rb_intern("to_json");
++    i_encode = rb_intern("encode");
++
++    char stack_buffer[FBUFFER_STACK_SIZE];
++    FBuffer buffer = {
++        .io = Qfalse,
++    };
++    fbuffer_stack_init(&buffer, state.buffer_initial_length, stack_buffer, FBUFFER_STACK_SIZE);
++    fbuffer_append(&buffer, "{\"ok\":", 6);
++
++    struct generate_json_data data = {
++        .buffer = &buffer,
++        .vstate = Qfalse,
++        .state = &state,
++        .obj = obj,
++        .func = generate_json,
++    };
++
++    struct error error = generate_json(&buffer, &data, &state, obj);
++
++    if (error.kind == error_kind_ok) {
++        fbuffer_append_char(&buffer, '}');
++    } else {
++        fbuffer_free(&buffer);
++        return rb_sprintf("{\"error\":%s"PRIsVALUE"}", error.message);
++    }
++
++    return fbuffer_finalize(&buffer);
++}
++
++static const char* args_to_dtrace_probe_arg(VALUE args) {
++    VALUE json = cState_m_generate(args);
++    return StringValueCStr(json);
++}
+diff --git a/probes.d b/probes.d
+index 0762a2d25f..00e94a5439 100644
+--- a/probes.d
++++ b/probes.d
+@@ -12,14 +12,14 @@ provider ruby {
+      * `filename` the file name where the method is _being called_ (a string)
+      * `lineno` the line number where the method is _being called_ (an int)
+   */
+-  probe method__entry(const char *classname, const char *methodname, const char *filename, int lineno);
++  probe method__entry(const char *classname, const char *methodname, const char *filename, int lineno, const char* args);
+   /*
+      ruby:::method-return(classname, methodname, filename, lineno);
+ 
+      This probe is fired just after a method has returned. The arguments are
+      the same as "ruby:::method-entry".
+   */
+-  probe method__return(const char *classname, const char *methodname, const char *filename, int lineno);
++  probe method__return(const char *classname, const char *methodname, const char *filename, int lineno, const char* args);
+ 
+   /*
+      ruby:::cmethod-entry(classname, methodname, filename, lineno);
+@@ -27,14 +27,14 @@ provider ruby {
+      This probe is fired just before a C method is entered. The arguments are
+      the same as "ruby:::method-entry".
+   */
+-  probe cmethod__entry(const char *classname, const char *methodname, const char *filename, int lineno);
++  probe cmethod__entry(const char *classname, const char *methodname, const char *filename, int lineno, const char* args);
+   /*
+      ruby:::cmethod-return(classname, methodname, filename, lineno);
+ 
+      This probe is fired just before a C method returns. The arguments are
+      the same as "ruby:::method-entry".
+   */
+-  probe cmethod__return(const char *classname, const char *methodname, const char *filename, int lineno);
++  probe cmethod__return(const char *classname, const char *methodname, const char *filename, int lineno, const char* args);
+ 
+   /*
+      ruby:::require-entry(requiredfile, filename, lineno);
+diff --git a/probes_helper.h b/probes_helper.h
+index 16d81b9ffb..7b90474a87 100644
+--- a/probes_helper.h
++++ b/probes_helper.h
+@@ -22,7 +22,7 @@ do { \
+             RUBY_DTRACE_##name(args.classname, \
+                                args.methodname, \
+                                args.filename, \
+-                               args.line_no); \
++                               args.line_no, NULL); \
+         } \
+     } \
+ } while (0)
+diff --git a/vm_insnhelper.c b/vm_insnhelper.c
+index 66ded96789..4f584aab3b 100644
+--- a/vm_insnhelper.c
++++ b/vm_insnhelper.c
+@@ -5941,6 +5941,10 @@ enum method_explorer_type {
+     mexp_search_super,
+ };
+ 
++static __thread int dtrace_probe_is_enabled = 0;
++
++#include "generate_json_helper.c"
++
+ static inline VALUE
+ vm_sendish(
+     struct rb_execution_context_struct *ec,
+@@ -5961,6 +5965,35 @@ vm_sendish(
+         .argc = argc,
+         .cd = cd,
+     };
++    struct ruby_dtrace_method_hook_args dtrace_probe_args = { .line_no = -1 };
++
++    ID id = 0;
++    VALUE klass = 0;
++    rb_ec_frame_method_id_and_class(ec, &id, 0, &klass);
++
++    const char *methodname = rb_id2name(id);
++
++//    if (methodname)
++//        printf("vm_sendish method: %s\n", methodname);
++
++    if (UNLIKELY((RUBY_DTRACE_METHOD_ENTRY_ENABLED() || RUBY_DTRACE_METHOD_RETURN_ENABLED()) && !dtrace_probe_is_enabled)) {
++        ID id = 0;
++        VALUE klazz = 0;
++
++        VALUE* argv = reg_cfp->sp - calling.argc;
++        dtrace_probe_is_enabled = 1;
++        VALUE args = rb_ary_new_from_values(argc, argv);
++        const char* result = args_to_dtrace_probe_arg(args);
++//        const char* result = inspect_args(calling.argc, argv);
++        dtrace_probe_is_enabled = 0;
++
++        if (rb_dtrace_setup(ec, klazz, id, &dtrace_probe_args)) {
++            RUBY_DTRACE_METHOD_ENTRY(dtrace_probe_args.classname,
++                                     dtrace_probe_args.methodname,
++                                     dtrace_probe_args.filename,
++                                     dtrace_probe_args.line_no, result);
++        }
++    }
+ 
+     switch (method_explorer) {
+       case mexp_search_method:
+@@ -5975,6 +6008,15 @@ vm_sendish(
+         val = vm_invokeblock_i(ec, GET_CFP(), &calling);
+         break;
+     }
++
++    if (UNLIKELY(dtrace_probe_args.line_no != -1))
++    {
++        RUBY_DTRACE_METHOD_RETURN(dtrace_probe_args.classname,
++                                 dtrace_probe_args.methodname,
++                                 dtrace_probe_args.filename,
++                                 dtrace_probe_args.line_no, NULL);
++    }
++
+     return val;
+ }
+ 
