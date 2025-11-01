@@ -82,7 +82,7 @@ RUN set -eux; \
 	./configure \
 		--build="$gnuArch" \
 		--disable-install-doc \
-		--disable-shared \
+		--enable-shared \
 		--enable-dtrace \
 		optflags="-fno-omit-frame-pointer" \
 		${rustArch:+--enable-yjit} \

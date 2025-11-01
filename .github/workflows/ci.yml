@@ -7,7 +7,7 @@ name: CI
 
 env:
   IMAGE_NAME: ruby
-  IMAGE_VERSION: 3.4.0-dtrace
+  IMAGE_VERSION: 3.4.0-dtrace-shared
 
 jobs:
   build-and-push:
