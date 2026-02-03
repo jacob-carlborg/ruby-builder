@@ -7,7 +7,7 @@ name: CI
 
 env:
   IMAGE_NAME: ruby
-  IMAGE_VERSION: 3.4.1-dtrace-all-calls-no-json
+  IMAGE_VERSION: 4.0.0-dtrace-all-calls-no-json
 
 jobs:
   build-and-push:
