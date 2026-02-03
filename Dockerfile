@@ -15,9 +15,9 @@ RUN set -eux; \
 ENV LANG C.UTF-8
 
 # https://www.ruby-lang.org/en/news/2024/12/25/ruby-3-4-1-released/
-ENV RUBY_VERSION 3.4.1
-ENV RUBY_DOWNLOAD_URL https://cache.ruby-lang.org/pub/ruby/3.4/ruby-3.4.1.tar.xz
-ENV RUBY_DOWNLOAD_SHA256 018d59ffb52be3c0a6d847e22d3fd7a2c52d0ddfee249d3517a0c8c6dbfa70af
+ENV RUBY_VERSION 4.0.0
+ENV RUBY_DOWNLOAD_URL https://cache.ruby-lang.org/pub/ruby/4.0/ruby-4.0.0.tar.xz
+ENV RUBY_DOWNLOAD_SHA256 a72bacee9de07283ebc19baa4ac243b193129f21aa4e168c7186fb1fe7d07fe1
 
 COPY dtrace.patch /tmp/dtrace.patch
 COPY dtrace-all-calls-no-json.patch /tmp/dtrace-all-calls-no-json.patch
