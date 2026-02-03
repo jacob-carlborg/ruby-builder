@@ -20,6 +20,7 @@ ENV RUBY_DOWNLOAD_URL https://cache.ruby-lang.org/pub/ruby/3.4/ruby-3.4.1.tar.xz
 ENV RUBY_DOWNLOAD_SHA256 018d59ffb52be3c0a6d847e22d3fd7a2c52d0ddfee249d3517a0c8c6dbfa70af
 
 COPY dtrace.patch /tmp/dtrace.patch
+COPY dtrace-all-calls-no-json.patch /tmp/dtrace-all-calls-no-json.patch
 
 # some of ruby's build scripts are written in ruby
 #   we purge system ruby later to make sure our final image uses what we just built
@@ -75,7 +76,7 @@ RUN set -eux; \
 	} > file.c.new; \
 	mv file.c.new file.c; \
 	\
-	patch -p1 < /tmp/dtrace.patch; \
+	patch -p1 < /tmp/dtrace-all-calls-no-json.patch; \
 	\
 	autoconf; \
 	gnuArch="$(dpkg-architecture --query DEB_BUILD_GNU_TYPE)"; \
