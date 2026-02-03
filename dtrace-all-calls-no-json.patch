@@ -331,8 +331,3 @@ index 60e1b647ae..54d0c8302d 100644
          rb_exec_event_hook_orig(ec, global_hooks, event, self, 0, 0, 0 , val, 0);
          reg_cfp->pc--;
      }
-@@ -7572,4 +7556,3 @@ rb_vm_lvar_exposed(rb_execution_context_t *ec, int index)
-     const rb_control_frame_t *cfp = ec->cfp;
-     return cfp->ep[index];
- }
--
